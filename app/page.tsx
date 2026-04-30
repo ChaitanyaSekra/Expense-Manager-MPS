@@ -16,6 +16,12 @@ interface ExpensesData {
 }
 interface ToastItem { id: number; msg: string; type: 'success' | 'error'; }
 
+// ─── Constants ────────────────────────────────────────────────────────────────
+const ALL_TIME_CACHE_KEY  = 'sekra_alltime_';   // + userId suffix
+const ALL_TIME_CACHE_TTL  = 5 * 60 * 1000;      // 5 minutes
+const CAT_CACHE_KEY       = 'sekra_categories';
+const CAT_CACHE_TTL       = 10 * 60 * 1000;     // 10 minutes
+
 // ─── Utilities ────────────────────────────────────────────────────────────────
 const initials = (name: string) => name.trim().split(/\s+/).map((w: string) => w[0]).join('').toUpperCase().slice(0, 2);
 const fmt = (n: number) => Number(n).toLocaleString('en-IN', { maximumFractionDigits: 2 });
@@ -30,6 +36,25 @@ async function apiFetch(path: string, options: RequestInit = {}) {
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || 'Request failed');
   return data;
+}
+
+// ─── localStorage helpers ─────────────────────────────────────────────────────
+function lsGet<T>(key: string, ttl: number): T | null {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const { ts, value } = JSON.parse(raw);
+    if (Date.now() - ts > ttl) { localStorage.removeItem(key); return null; }
+    return value as T;
+  } catch { return null; }
+}
+
+function lsSet(key: string, value: unknown) {
+  try { localStorage.setItem(key, JSON.stringify({ ts: Date.now(), value })); } catch {}
+}
+
+function lsDel(key: string) {
+  try { localStorage.removeItem(key); } catch {}
 }
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
@@ -149,7 +174,6 @@ function ManageCategoriesModal({ open, onClose, categories, onRefresh, toast }:
   const [showNewForm, setShowNewForm] = useState(false);
   const [showEmojiPicker, setShowEmojiPicker] = useState<'new' | 'edit' | null>(null);
 
-  // Reset when modal closes
   useEffect(() => {
     if (!open) {
       setEditId(null); setShowNewForm(false);
@@ -178,6 +202,8 @@ function ManageCategoriesModal({ open, onClose, categories, onRefresh, toast }:
       });
       toast('Category updated ✓');
       setEditId(null);
+      // Bust category cache so next load is fresh
+      lsDel(CAT_CACHE_KEY);
       onRefresh();
     } catch (e: unknown) {
       toast(e instanceof Error ? e.message : 'Update failed', 'error');
@@ -192,6 +218,7 @@ function ManageCategoriesModal({ open, onClose, categories, onRefresh, toast }:
     try {
       await apiFetch(`/api/categories/${cat.id}`, { method: 'DELETE' });
       toast('Category deleted');
+      lsDel(CAT_CACHE_KEY);
       onRefresh();
     } catch (e: unknown) {
       toast(e instanceof Error ? e.message : 'Delete failed', 'error');
@@ -212,6 +239,7 @@ function ManageCategoriesModal({ open, onClose, categories, onRefresh, toast }:
       setNewName(''); setNewEmoji('📦');
       setShowNewForm(false);
       setShowEmojiPicker(null);
+      lsDel(CAT_CACHE_KEY);
       onRefresh();
     } catch (e: unknown) {
       toast(e instanceof Error ? e.message : 'Add failed', 'error');
@@ -230,15 +258,12 @@ function ManageCategoriesModal({ open, onClose, categories, onRefresh, toast }:
         </div>
         <div className="modal-body">
 
-          {/* Category list */}
           <div className="cat-manage-list">
             {categories.map(cat => (
               <div key={cat.id} className="cat-manage-row">
                 {editId === cat.id ? (
-                  /* ── Edit row ── */
                   <div className="cat-manage-edit-form">
                     <div className="cat-manage-edit-top">
-                      {/* Emoji button */}
                       <div className="cat-manage-emoji-wrap">
                         <button className="cat-manage-emoji-btn"
                           onClick={() => setShowEmojiPicker(p => p === 'edit' ? null : 'edit')}>
@@ -267,7 +292,6 @@ function ManageCategoriesModal({ open, onClose, categories, onRefresh, toast }:
                     </div>
                   </div>
                 ) : (
-                  /* ── Display row ── */
                   <>
                     <div className="cat-manage-info">
                       <span className="cat-manage-emoji">{cat.emoji}</span>
@@ -298,7 +322,6 @@ function ManageCategoriesModal({ open, onClose, categories, onRefresh, toast }:
             ))}
           </div>
 
-          {/* Add new category */}
           {showNewForm ? (
             <div className="cat-manage-new-form">
               <div className="cat-manage-new-label">New Category</div>
@@ -374,7 +397,6 @@ export default function App() {
   const [category, setCategory] = useState('');
   const [paymentMode, setPaymentMode] = useState<'cash' | 'online'>('cash');
 
-  // ── Categories from DB ────────────────────────────────────────────────────
   const [categories, setCategories] = useState<Category[]>([]);
   const [catManageOpen, setCatManageOpen] = useState(false);
 
@@ -431,8 +453,17 @@ export default function App() {
     };
   }, []);
 
+  // ── Chart: only re-fetch when user or screen changes, NOT on filter change ──
   useEffect(() => {
-    if (currentUser && screen === 'dashboard') { loadExpenses(); loadChart(); loadAllTime(); }
+    if (currentUser && screen === 'dashboard') loadChart();
+  }, [currentUser, screen]);
+
+  // ── Expenses + allTime: re-fetch on filter or user/screen change ───────────
+  useEffect(() => {
+    if (currentUser && screen === 'dashboard') {
+      loadExpenses();
+      loadAllTime();
+    }
   }, [currentUser, screen, dateRange, filterFrom, filterTo]);
 
   // ── API helpers ───────────────────────────────────────────────────────────
@@ -441,10 +472,24 @@ export default function App() {
   };
 
   const loadCategories = async () => {
-    try { setCategories(await apiFetch('/api/categories')); } catch {}
+    // Serve from cache if fresh, background-refresh if stale
+    const cached = lsGet<Category[]>(CAT_CACHE_KEY, CAT_CACHE_TTL);
+    if (cached) {
+      setCategories(cached);
+      // Silently refresh in background so next render has fresh data
+      apiFetch('/api/categories').then(data => {
+        setCategories(data);
+        lsSet(CAT_CACHE_KEY, data);
+      }).catch(() => {});
+      return;
+    }
+    try {
+      const data = await apiFetch('/api/categories');
+      setCategories(data);
+      lsSet(CAT_CACHE_KEY, data);
+    } catch {}
   };
 
-  // Helper: get emoji for a category name from the loaded list
   const getCategoryEmoji = (catName: string) =>
     categories.find(c => c.name.toLowerCase() === catName.toLowerCase())?.emoji || '📦';
 
@@ -479,11 +524,24 @@ export default function App() {
     finally { setLoading(false); }
   };
 
-  const loadAllTime = async () => {
+  // loadAllTime: serves from localStorage cache (5 min TTL).
+  // Mutations (save/delete) bust the cache before calling this so fresh data is always fetched after writes.
+  const loadAllTime = async (bustCache = false) => {
     if (!currentUser) return;
+    const cacheKey = ALL_TIME_CACHE_KEY + currentUser.id;
+
+    if (!bustCache) {
+      const cached = lsGet<ExpensesData>(cacheKey, ALL_TIME_CACHE_TTL);
+      if (cached) {
+        setAllTimeData(cached);
+        return; // skip the network read entirely
+      }
+    }
+
     try {
       const data = await apiFetch(`/api/expenses/${currentUser.id}?grouped=true`);
       setAllTimeData(data);
+      lsSet(cacheKey, data);
     } catch {}
   };
 
@@ -565,7 +623,12 @@ export default function App() {
         await apiFetch('/api/expenses', { method: 'POST', body: JSON.stringify({ user_id: currentUser!.id, amount: amt, type: entryType, category: cat, description: desc, date: expDate, payment_mode: paymentMode }) });
         toast('Entry added ✓');
       }
-      setExpModal(false); loadExpenses(); loadChart();
+      // Bust allTime cache before reloading — mutation means cached totals are stale
+      if (currentUser) lsDel(ALL_TIME_CACHE_KEY + currentUser.id);
+      setExpModal(false);
+      loadExpenses();
+      loadAllTime(true); // bustCache=true, will fetch fresh
+      loadChart();
     } catch (e: unknown) { toast(e instanceof Error ? e.message : 'Failed to save', 'error'); }
   };
 
@@ -573,17 +636,21 @@ export default function App() {
     if (!confirm('Delete this entry?')) return;
     try {
       await apiFetch(`/api/expense/${id}`, { method: 'DELETE' });
-      toast('Entry deleted'); loadExpenses(); loadChart();
+      toast('Entry deleted');
+      if (currentUser) lsDel(ALL_TIME_CACHE_KEY + currentUser.id);
+      loadExpenses();
+      loadAllTime(true);
+      loadChart();
     } catch (e: unknown) { toast(e instanceof Error ? e.message : 'Delete failed', 'error'); }
   };
 
-  // ── Handler: add new category from the dropdown in the expense form ────────
+  // ── Handler: add new category from expense form dropdown ──────────────────
   const handleAddCategoryFromDropdown = async (name: string) => {
-    // Use 📦 as default emoji when adding from the expense form quick-add
     await apiFetch('/api/categories', {
       method: 'POST',
       body: JSON.stringify({ name: name.trim(), emoji: '📦' }),
     });
+    lsDel(CAT_CACHE_KEY);
     await loadCategories();
   };
 
@@ -618,82 +685,92 @@ export default function App() {
   // ── Chart ─────────────────────────────────────────────────────────────────
   const chartDays = (() => {
     const days = [];
-    const now = new Date();
+    const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
     for (let i = 6; i >= 0; i--) {
-      const d = new Date(now); d.setDate(d.getDate() - i);
-      const key = d.toISOString().slice(0, 10);
-      const row = chartData.find(r => r.date === key);
-      days.push({ key, total: row?.total || 0, isToday: i === 0 });
+      const d = new Date(nowIST);
+      d.setDate(d.getDate() - i);
+      const key = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+      const found = chartData.find(x => x.date === key);
+      days.push({ key, total: found?.total ?? 0, isToday: i === 0 });
     }
     return days;
   })();
+
   const chartMax = Math.max(...chartDays.map(d => d.total), 1);
-  const dayNames = ['S','M','T','W','T','F','S'];
+  const dayNames = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
 
-  const balance  = allTimeData?.balance      || 0;
-  const income   = allTimeData?.total_income  || 0;
-  const expense  = allTimeData?.total_expense || 0;
-  const count    = (expData?.groups || []).reduce((s, g) => s + g.expenses.length, 0);
-  const rangedIncome  = expData?.total_income  || 0;
-  const rangedExpense = expData?.total_expense || 0;
+  // ── Derived values ────────────────────────────────────────────────────────
+  // Balance card always shows all-time figures
+  const balance = allTimeData?.balance ?? 0;
+  const income  = allTimeData?.total_income ?? 0;
+  const expense = allTimeData?.total_expense ?? 0;
+  // Range summary uses filtered expData
+  const rangedIncome  = expData?.total_income ?? 0;
+  const rangedExpense = expData?.total_expense ?? 0;
+  const count = allTimeData?.groups?.reduce((s, g) => s + g.expenses.length, 0) ?? 0;
 
-  // ─── Render ───────────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <>
-      {offline && <div className="offline-banner visible">📡 You&apos;re offline — showing cached data</div>}
-
-      {showInstall && (
-        <div className="install-banner">
-          <div className="install-banner-icon">📱</div>
-          <div className="install-banner-text">
-            <strong>Install Sekra</strong>
-            <span>Add to home screen for quick access</span>
-          </div>
-          <div className="install-banner-actions">
-            <button className="btn-install" onClick={async () => {
-              if (!installPrompt) return;
-              (installPrompt as BeforeInstallPromptEvent).prompt();
-              const { outcome } = await (installPrompt as BeforeInstallPromptEvent).userChoice;
-              setInstallPrompt(null); setShowInstall(false);
-              if (outcome === 'accepted') toast('App installed! 🎉');
-            }}>Install</button>
-            <button className="btn-dismiss" onClick={() => { setShowInstall(false); localStorage.setItem('sekra_install_dismissed', '1'); }}>✕</button>
-          </div>
-        </div>
-      )}
-
       <div className="app-shell">
+
         {/* ── LOGIN ── */}
         {screen === 'login' && (
           <div className="login-screen">
             <div className="login-logo">
-              <h1><span className="logo-accent">Sekra</span></h1>
-              <p>Personal budget tracker</p>
+              <h1>Sekra</h1>
+              <p>Your personal budget tracker</p>
             </div>
+
+            {offline && <div className="offline-banner">📡 You're offline</div>}
+
+            {showInstall && (
+              <div className="install-banner">
+                <span>Add Sekra to your home screen</span>
+                <div className="install-banner-actions">
+                  <button className="btn btn-primary btn-sm" onClick={async () => {
+                    if (installPrompt) {
+                      (installPrompt as BeforeInstallPromptEvent).prompt();
+                      const { outcome } = await (installPrompt as BeforeInstallPromptEvent).userChoice;
+                      if (outcome === 'accepted') setShowInstall(false);
+                    }
+                  }}>Install</button>
+                  <button className="btn btn-ghost btn-sm" onClick={() => {
+                    setShowInstall(false);
+                    localStorage.setItem('sekra_install_dismissed', '1');
+                  }}>Later</button>
+                </div>
+              </div>
+            )}
+
             <div className="login-card">
               {users.length > 0 && (
-                <>
-                  <h2>Who&apos;s tracking?</h2>
-                  <div className="user-grid">
-                    {users.map(u => (
-                      <div key={u.id} className={`user-chip${selectedUser?.id === u.id ? ' selected' : ''}`}
-                        onClick={() => { setSelectedUser(u); setNewName(''); }}>
-                        <div className="chip-avatar">{initials(u.name)}</div>
-                        <span className="chip-name">{u.name}</span>
-                      </div>
-                    ))}
-                  </div>
-                  <div className="divider">or</div>
-                </>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 4 }}>
+                  {users.map(u => (
+                    <button key={u.id}
+                      className={`user-chip${selectedUser?.id === u.id ? ' selected' : ''}`}
+                      onClick={() => {
+                        setSelectedUser(s => s?.id === u.id ? null : u);
+                        setNewName('');
+                        setPinBuffer('');
+                      }}>
+                      <div className="chip-avatar">{initials(u.name)}</div>
+                      <span className="chip-name">{u.name}</span>
+                    </button>
+                  ))}
+                </div>
               )}
+
+              {/* Always visible so user can create a new account at any time */}
+              {users.length > 0 && <div className="divider"><span>or create new</span></div>}
               <div className="form-group">
-                <label>New user</label>
-                <input className="form-control" placeholder="Your name…" value={newName}
-                  onChange={e => { setNewName(e.target.value); setSelectedUser(null); }} />
+                <label>Your name</label>
+                <input className="form-control" placeholder="Enter your name" value={newName}
+                  onChange={e => { setNewName(e.target.value); if (e.target.value) setSelectedUser(null); }} />
               </div>
-              {newName.trim() && !selectedUser && (
+              {newName.trim().length > 0 && (
                 <div className="form-group">
-                  <label>Set a PIN (optional)</label>
+                  <label>PIN (optional)</label>
                   <div className="pin-dots">
                     {[0,1,2,3].map(i => <div key={i} className={`pin-dot${pinBuffer.length > i ? ' filled' : ''}`} />)}
                   </div>
@@ -740,7 +817,7 @@ export default function App() {
             </div>
 
             <div className="screen" style={{ animation: 'none', minHeight: 'unset', flex: 1 }}>
-              {/* Total card */}
+              {/* Balance card */}
               <div className="total-card">
                 <div className="total-label">Balance</div>
                 <div className="total-amount">
@@ -840,7 +917,7 @@ export default function App() {
                 </div>
               )}
 
-              {/* Categories */}
+              {/* Transaction list */}
               <div className="categories-section">
                 {loading ? (
                   <div className="loader"><div className="spinner" /></div>
@@ -917,7 +994,6 @@ export default function App() {
                   👥 Export All Members
                 </button>
 
-                {/* ── Manage Categories ── */}
                 <button className="btn btn-ghost profile-cat-btn" onClick={() => setCatManageOpen(true)}>
                   <span className="profile-cat-btn-left">
                     <span className="profile-cat-emoji-strip">
@@ -950,7 +1026,8 @@ export default function App() {
             </nav>
           </>
         )}
-      </div>
+
+      </div>{/* end app-shell */}
 
       {/* ── EXPENSE MODAL ── */}
       <div className={`modal-overlay${expModal ? ' open' : ''}`} onClick={e => { if (e.target === e.currentTarget) setExpModal(false); }}>
@@ -1177,6 +1254,7 @@ function CategoryCard({ group, getCategoryEmoji, onEdit, onDelete }: {
           <div className="cat-name">{group.category}</div>
           <div className="cat-count">{group.expenses.length} item{group.expenses.length !== 1 ? 's' : ''}</div>
         </div>
+        {/* Fixed: use net (signed correctly) instead of total (always positive) */}
         <div className="cat-total">{group.net >= 0 ? '+' : '-'}₹{fmt(Math.abs(group.net))}</div>
         <svg className="cat-chevron" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
           <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7"/>
